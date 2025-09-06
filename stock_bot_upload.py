@@ -6,11 +6,12 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from urllib.parse import urlparse
 import html
+import yfinance as yf  # Added yfinance import
 
 # -----------------------------
 # Config & API keys (free)
 # -----------------------------
-st.set_page_config(page_title="📊 Stock Analysis Dashboard", layout="wide")
+st.set_page_config(page_title="📊 Stock Bot", layout="wide")
 
 # Replace with your actual API keys (free tiers)
 ALPHA_VANTAGE_API_KEY = st.secrets.get("ALPHA_VANTAGE_API_KEY", "demo")
@@ -125,29 +126,33 @@ def safe_dt_str(dt_str):
         return str(dt_str)
 
 # -----------------------------
-# Data Fetching (cached)
+# Data Fetching (cached) - Updated to use yfinance
 # -----------------------------
 @st.cache_data(ttl=300)  # cache for 5 minutes
-def fetch_stock_data(symbol):
-    url = (
-        "https://www.alphavantage.co/query"
-        f"?function=TIME_SERIES_DAILY&symbol={symbol}"
-        f"&apikey={ALPHA_VANTAGE_API_KEY}&outputsize=compact"
-    )
+def fetch_stock_data(symbol, is_hk_stock=False):
+    # For HK stocks, append .HK to the symbol
+    ticker_symbol = f"{symbol}.HK" if is_hk_stock else symbol
+    
     try:
-        resp = requests.get(url, timeout=30)
-        data = resp.json()
-    except Exception:
+        ticker = yf.Ticker(ticker_symbol)
+        hist = ticker.history(period="6mo")  # Get 6 months of data
+        
+        if hist.empty:
+            return None
+            
+        # Rename columns to match your existing format
+        hist = hist.rename(columns={
+            'Open': '1. open',
+            'High': '2. high',
+            'Low': '3. low',
+            'Close': '4. close',
+            'Volume': '5. volume'
+        })
+        
+        return hist
+    except Exception as e:
+        st.error(f"Error fetching data: {e}")
         return None
-
-    if "Time Series (Daily)" not in data:
-        return None
-
-    df = pd.DataFrame.from_dict(data["Time Series (Daily)"], orient="index", dtype=float)
-    # Expected columns: '1. open','2. high','3. low','4. close','5. volume'
-    df.index = pd.to_datetime(df.index)
-    df.sort_index(inplace=True)
-    return df
 
 # -----------------------------
 # Indicators
@@ -244,14 +249,17 @@ def sentiment_to_text(sentiment_score):
 # News & sentiment (cached)
 # -----------------------------
 @st.cache_data(ttl=300)
-def fetch_news_sentiment(symbol):
+def fetch_news_sentiment(symbol, is_hk_stock=False):
     """
     Returns (avg_sentiment: float|None, articles: list[dict])
     Each article: {title, url, source, published_at, sentiment, description}
     """
+    # For HK stocks, we'll try both with and without .HK suffix
+    search_symbols = f"{symbol}.HK,{symbol}" if is_hk_stock else symbol
+    
     url = (
         f"https://api.marketaux.com/v1/news/all"
-        f"?symbols={symbol}&filter_entities=true&language=en&api_token={MARKETAUX_API_KEY}"
+        f"?symbols={search_symbols}&filter_entities=true&language=en&api_token={MARKETAUX_API_KEY}"
     )
     try:
         resp = requests.get(url, timeout=30)
@@ -354,17 +362,26 @@ def combined_recommendation(rsi_val, macd_signal, sentiment):
 # -----------------------------
 # UI
 # -----------------------------
-st.title("📊 Stock Analysis Dashboard")
-symbol = st.text_input("Enter Stock Symbol (e.g., AAPL, MSFT)").strip().upper()
+st.title("📊 Stock Analysis Bot")
+
+# Add market selection
+market_type = st.radio("Select Market:", ("Hong Kong", "US"), horizontal=True)
+
+symbol = st.text_input(
+    "Enter Stock Symbol", 
+    placeholder="e.g., 0001 (HK) or AAPL (US)" if market_type == "Hong Kong" else "e.g., AAPL, MSFT"
+).strip().upper()
 
 if symbol:
-    df = fetch_stock_data(symbol)
+    is_hk_stock = (market_type == "Hong Kong")
+    df = fetch_stock_data(symbol, is_hk_stock)
+    
     if df is None or df.empty:
         st.error("Failed to fetch stock data. Please check the symbol and try again.")
         st.stop()
 
     # Window for display (no date selector needed)
-    LOOKBACK_DAYS = 100
+    LOOKBACK_DAYS = min(100, len(df))
     idx_plot = df.index[-LOOKBACK_DAYS:]
     df_plot = df.loc[idx_plot]
 
@@ -376,7 +393,8 @@ if symbol:
     volume_series = df['5. volume']
 
     latest_update_date = df.index[-1].strftime("%Y-%m-%d")
-    st.caption(f"📅 Latest stock data update: {latest_update_date}")
+    display_symbol = f"{symbol}.HK" if is_hk_stock else symbol
+    st.caption(f"📅 Latest stock data for {display_symbol}: {latest_update_date}")
 
     # Compute indicators
     rsi = calculate_rsi(df)
@@ -397,7 +415,7 @@ if symbol:
 
     # Latest values
     latest_close = close_series.iloc[-1]
-    latest_rsi = float(rsi.iloc[-1])
+    latest_rsi = float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50
     latest_stoch_k = float(stoch_k.iloc[-1]) if not np.isnan(stoch_k.iloc[-1]) else None
     latest_stoch_d = float(stoch_d.iloc[-1]) if not np.isnan(stoch_d.iloc[-1]) else None
     latest_atr = float(atr14.iloc[-1]) if not np.isnan(atr14.iloc[-1]) else None
@@ -410,7 +428,7 @@ if symbol:
         elif macd.iloc[-2] > signal.iloc[-2] and macd.iloc[-1] < signal.iloc[-1]:
             latest_macd_signal = "sell"
 
-    sentiment_score, articles = fetch_news_sentiment(symbol)
+    sentiment_score, articles = fetch_news_sentiment(symbol, is_hk_stock)
 
     # Recommendation banner
     recommendation, rsi_text, macd_text, sentiment_text, banner_type = combined_recommendation(
@@ -421,7 +439,7 @@ if symbol:
     # KPI row
     kpi1, kpi2, kpi3 = st.columns(3)
     with kpi1:
-        st.metric("Last Close", f"${latest_close:,.2f}")
+        st.metric("Last Close", f"${latest_close:,.2f}" if not is_hk_stock else f"HK${latest_close:,.2f}")
     with kpi2:
         st.metric("RSI (14)", f"{latest_rsi:.2f}")
     with kpi3:
@@ -594,7 +612,7 @@ if symbol:
 
     # Legend below, margin increased to avoid overlap with title
     fig_price.update_layout(
-        title=f"{symbol} — Price with SMA(20/50) & Bollinger Bands",
+        title=f"{display_symbol} — Price with SMA(20/50) & Bollinger Bands",
         xaxis=dict(showgrid=False),
         yaxis=dict(title="Price"),
         xaxis2=dict(showgrid=False),
