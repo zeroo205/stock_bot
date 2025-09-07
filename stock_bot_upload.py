@@ -153,6 +153,58 @@ def fetch_stock_data(symbol, is_hk_stock=False):
     except Exception as e:
         st.error(f"Error fetching data: {e}")
         return None
+    
+# --- Company name helpers (place right after fetch_stock_data) ---
+@st.cache_data(ttl=86400)  # cache for 1 day
+def get_company_name(symbol, is_hk_stock=False):
+    """
+    Returns the company name. If HK stock, prefer Traditional Chinese.
+    """
+    ticker_symbol = f"{symbol}.HK" if is_hk_stock else symbol
+    name = None
+
+    # 1) Try yfinance
+    try:
+        t = yf.Ticker(ticker_symbol)
+        info = {}
+        try:
+            info = t.get_info()          # newer yfinance
+        except Exception:
+            info = getattr(t, "info", {}) or {}  # back-compat
+        name = info.get("longName") or info.get("shortName") or info.get("displayName")
+    except Exception:
+        pass
+
+    # 2) If HK, prefer Traditional Chinese from Yahoo
+    if is_hk_stock:
+        zh_name = _get_yahoo_zh_name(ticker_symbol)
+        if zh_name:
+            name = zh_name
+
+    return name
+
+def _get_yahoo_zh_name(ticker_symbol):
+    """
+    Gets localized (Traditional Chinese) company name from Yahoo Finance.
+    Returns None if not available.
+    """
+    try:
+        url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker_symbol}?modules=price"
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept-Language": "zh-Hant-HK,zh-Hant,zh-TW,zh;q=0.9"
+        }
+        r = requests.get(url, timeout=15, headers=headers)
+        data = r.json()
+        price = data["quoteSummary"]["result"][0]["price"]
+        name = price.get("longName") or price.get("shortName")
+
+        # Contains CJK characters? then it's likely Chinese already
+        if name and any('\u4e00' <= ch <= '\u9fff' for ch in name):
+            return name
+        return None
+    except Exception:
+        return None
 
 # -----------------------------
 # Indicators
@@ -394,7 +446,13 @@ if symbol:
 
     latest_update_date = df.index[-1].strftime("%Y-%m-%d")
     display_symbol = f"{symbol}.HK" if is_hk_stock else symbol
-    st.caption(f"📅 Latest stock data for {display_symbol}: {latest_update_date}")
+
+    # NEW: fetch display name (HK → Traditional Chinese if possible)
+    company_name = get_company_name(symbol, is_hk_stock) or display_symbol
+    name_part = f"（{company_name}）" if company_name and company_name != display_symbol else ""
+
+    # UPDATED caption: put the name next to the symbol
+    st.caption(f"📅 Latest stock data for {display_symbol}{name_part}: {latest_update_date}")
 
     # Compute indicators
     rsi = calculate_rsi(df)
@@ -415,6 +473,7 @@ if symbol:
 
     # Latest values
     latest_close = close_series.iloc[-1]
+    company_name = get_company_name(symbol, is_hk_stock) or display_symbol
     latest_rsi = float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50
     latest_stoch_k = float(stoch_k.iloc[-1]) if not np.isnan(stoch_k.iloc[-1]) else None
     latest_stoch_d = float(stoch_d.iloc[-1]) if not np.isnan(stoch_d.iloc[-1]) else None
