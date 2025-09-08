@@ -1,20 +1,28 @@
-import streamlit as st
-import requests
-import pandas as pd
+# --- Imports ---
+import re
+import io
+import html
+from urllib.parse import urlparse
+
 import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+import yfinance as yf
+
+from bs4 import BeautifulSoup
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from urllib.parse import urlparse
-import html
-import yfinance as yf  # Added yfinance import
 
-# -----------------------------
-# Config & API keys (free)
-# -----------------------------
+try:
+    st.cache_data.clear()
+except Exception:
+    pass
+
+# --- Config & API keys (free) ---
 st.set_page_config(page_title="📊 Stock Bot", layout="wide")
 
-# Replace with your actual API keys (free tiers)
-ALPHA_VANTAGE_API_KEY = st.secrets.get("ALPHA_VANTAGE_API_KEY", "demo")
+# Remove unused Alpha Vantage API key
 MARKETAUX_API_KEY = st.secrets.get("MARKETAUX_API_KEY", "demo")
 
 # --- News section styles ---
@@ -91,10 +99,10 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# -----------------------------
-# Helpers
-# -----------------------------
 
+# ================================
+# Helpers
+# ================================
 def extract_domain(url: str | None) -> str:
     """Return 'example.com' from a URL (no scheme or path)."""
     if not url:
@@ -105,7 +113,7 @@ def extract_domain(url: str | None) -> str:
     except Exception:
         return ""
 
-def normalize_url(url):
+def normalize_url(url: str | None) -> str | None:
     """Return a normalized URL with scheme, or None."""
     if not url or not isinstance(url, str):
         return None
@@ -124,93 +132,338 @@ def safe_dt_str(dt_str):
         return pd.to_datetime(dt_str).strftime("%Y-%m-%d %H:%M")
     except Exception:
         return str(dt_str)
-
-# -----------------------------
-# Data Fetching (cached) - Updated to use yfinance
-# -----------------------------
-@st.cache_data(ttl=300)  # cache for 5 minutes
-def fetch_stock_data(symbol, is_hk_stock=False):
-    # For HK stocks, append .HK to the symbol
-    ticker_symbol = f"{symbol}.HK" if is_hk_stock else symbol
     
+# Reject obvious non-name labels that sometimes appear in titles/headers
+_GENERIC_BAD_TOKENS = {
+    "港股報價", "香港即時股票股價", "經濟通", "etnet",
+    "AASTOCKS", "阿思達克", "阿思達克財經網",
+    "Detail Quote", "Interactive Chart", "Real-time Quote", "詳細報價", "互動圖表", "即時報價",
+}
+
+def _best_chinese_segment(text: str) -> str:
+    """
+    Split by common separators and pick the segment with the highest Chinese-character ratio,
+    preferring shorter segments when ratios tie.
+    """
+    if not text:
+        return ""
+    parts = re.split(r"[|｜\-—–－]+", text)
+    candidates = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        # Drop segments containing obvious site/description phrases
+        lowered = p.lower()
+        if any(tok.lower() in lowered for tok in _GENERIC_BAD_TOKENS):
+            continue
+        # Keep segments that contain Chinese
+        if _contains_chinese(p):
+            chinese_chars = sum(1 for ch in p if "\u4e00" <= ch <= "\u9fff")
+            ratio = chinese_chars / max(len(p), 1)
+            candidates.append((ratio, len(p), p))
+    if candidates:
+        # Highest Chinese ratio first, then shortest
+        candidates.sort(key=lambda t: (-t[0], t[1]))
+        return candidates[0][2]
+    return text.strip()
+
+def _clean_company_name(txt: str, *, prefer_chinese_segment: bool = False) -> str:
+    """Strip code in parentheses, trim site suffixes, optionally pick best Chinese segment."""
+    if not txt:
+        return ""
+    # remove code in parentheses: "(0001)", "(0001.HK)", "（0001）", etc.
+    txt = re.sub(r"[\(（]\s*0*\d{4,5}\s*(?:\.HK)?\s*[\)）]", "", txt)
+    # if requested, pick the best Chinese segment first (useful for ETNet's very long titles)
+    if prefer_chinese_segment:
+        txt = _best_chinese_segment(txt)
+    # drop trailing " - something" or " — something"
+    txt = re.sub(r"\s*[-—–]\s*.*$", "", txt).strip()
+    return txt
+
+def _valid_company_name(txt: str) -> bool:
+    """Heuristic: contains Chinese, not generic labels, reasonable length."""
+    if not txt:
+        return False
+    if not _contains_chinese(txt):
+        return False
+    if any(tok.lower() in txt.lower() for tok in _GENERIC_BAD_TOKENS):
+        return False
+    return len(txt) >= 2
+
+
+# ================================
+# Data Fetching (cached) - yfinance
+# ================================
+@st.cache_data(ttl=300)  # cache for 5 minutes
+def fetch_stock_data(symbol: str, is_hk_stock: bool = False) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    """
+    Use yfinance. For HK stocks, append .HK to the ticker symbol.
+    Returns tuple: (daily_data_for_charts, intraday_data_for_timestamp)
+    """
+    ticker_symbol = f"{symbol}.HK" if is_hk_stock else symbol
     try:
         ticker = yf.Ticker(ticker_symbol)
-        hist = ticker.history(period="6mo")  # Get 6 months of data
         
-        if hist.empty:
-            return None
-            
-        # Rename columns to match your existing format
-        hist = hist.rename(columns={
-            'Open': '1. open',
-            'High': '2. high',
-            'Low': '3. low',
-            'Close': '4. close',
-            'Volume': '5. volume'
-        })
+        # Get daily data for charts
+        daily_hist = ticker.history(period="6mo", interval="1d")
         
-        return hist
+        # Get intraday data for latest timestamp
+        intraday_hist = ticker.history(period="1d", interval="1m")
+        
+        # Rename columns to match the expected format
+        daily_hist = daily_hist.rename(
+            columns={
+                "Open": "1. open",
+                "High": "2. high",
+                "Low": "3. low",
+                "Close": "4. close",
+                "Volume": "5. volume",
+            }
+        )
+        
+        intraday_hist = intraday_hist.rename(
+            columns={
+                "Open": "1. open",
+                "High": "2. high",
+                "Low": "3. low",
+                "Close": "4. close",
+                "Volume": "5. volume",
+            }
+        )
+        
+        return daily_hist, intraday_hist
     except Exception as e:
         st.error(f"Error fetching data: {e}")
-        return None
-    
-# --- Company name helpers (place right after fetch_stock_data) ---
-@st.cache_data(ttl=86400)  # cache for 1 day
-def get_company_name(symbol, is_hk_stock=False):
-    """
-    Returns the company name. If HK stock, prefer Traditional Chinese.
-    """
-    ticker_symbol = f"{symbol}.HK" if is_hk_stock else symbol
-    name = None
+        return None, None
 
-    # 1) Try yfinance
+
+# ================================
+# Company name helpers (HK = Chinese first)
+# ================================
+def _contains_chinese(text: str) -> bool:
+    """Check if text contains Chinese characters."""
+    if not text:
+        return False
+    chinese_ranges = [
+        (0x4E00, 0x9FFF),   # CJK Unified Ideographs
+        (0x3400, 0x4DBF),   # CJK Unified Ideographs Extension A
+        (0x20000, 0x2A6DF), # CJK Unified Ideographs Extension B
+        (0x2A700, 0x2B73F), # CJK Unified Ideographs Extension C
+        (0x2B740, 0x2B81F), # CJK Unified Ideographs Extension D
+        (0x2B820, 0x2CEAF), # CJK Unified Ideographs Extension E
+        (0x2CEB0, 0x2EBEF), # CJK Unified Ideographs Extension F
+        (0x3007, 0x3007),   # Ideographic number zero
+    ]
+    for char in text:
+        cp = ord(char)
+        for a, b in chinese_ranges:
+            if a <= cp <= b:
+                return True
+    return False
+
+
+def _pad_hk(symbol: str) -> str:
+    """
+    Zero-pad numeric HK codes to 5 digits (e.g., '5' -> '00005', '9988' -> '09988').
+    If non-numeric (ADRs/others), return as-is.
+    """
+    s = str(symbol).strip()
+    if re.fullmatch(r"\d+", s):
+        return s.zfill(5)
+    return s
+
+def _get_from_aastocks(symbol: str) -> str | None:
+    """
+    Get Traditional Chinese name from AASTOCKS Detail Quote page.
+    Example: https://www.aastocks.com/tc/stocks/quote/detail-quote.aspx?symbol=09988
+    """
     try:
-        t = yf.Ticker(ticker_symbol)
-        info = {}
-        try:
-            info = t.get_info()          # newer yfinance
-        except Exception:
-            info = getattr(t, "info", {}) or {}  # back-compat
-        name = info.get("longName") or info.get("shortName") or info.get("displayName")
-    except Exception:
-        pass
-
-    # 2) If HK, prefer Traditional Chinese from Yahoo
-    if is_hk_stock:
-        zh_name = _get_yahoo_zh_name(ticker_symbol)
-        if zh_name:
-            name = zh_name
-
-    return name
-
-def _get_yahoo_zh_name(ticker_symbol):
-    """
-    Gets localized (Traditional Chinese) company name from Yahoo Finance.
-    Returns None if not available.
-    """
-    try:
-        url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{ticker_symbol}?modules=price"
+        code = _pad_hk(symbol)
+        url = f"https://www.aastocks.com/tc/stocks/quote/detail-quote.aspx?symbol={code}"
         headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept-Language": "zh-Hant-HK,zh-Hant,zh-TW,zh;q=0.9"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept-Language": "zh-HK,zh-TW;q=0.9,zh;q=0.8,en-US;q=0.6,en;q=0.5",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         }
-        r = requests.get(url, timeout=15, headers=headers)
-        data = r.json()
-        price = data["quoteSummary"]["result"][0]["price"]
-        name = price.get("longName") or price.get("shortName")
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Contains CJK characters? then it's likely Chinese already
-        if name and any('\u4e00' <= ch <= '\u9fff' for ch in name):
-            return name
-        return None
+        # ---- 1) Prefer the <title> ONLY if it contains the code pattern '(09988.HK)' ----
+        title = soup.find("title")
+        if title:
+            t = title.get_text(strip=True)
+            # Extract "...name..." only if title has stock code like (09988.HK)
+            m = re.search(r'([^\(\（]+?)\s*[\(（]\s*0*\d{4,5}\.HK\s*[\)）]', t)
+            if m:
+                cand = _clean_company_name(m.group(1))
+                if _valid_company_name(cand):
+                    return cand
+
+        # ---- 2) Look into visible name containers, clean and validate ----
+        selectors = [
+            '#stockName',               # if present
+            'h1', 'h2',
+            'div[class*="name"]', 'span[class*="name"]',
+            '.quote-header h1', '.stock-name',
+        ]
+        for sel in selectors:
+            for el in soup.select(sel):
+                cand = _clean_company_name(el.get_text(strip=True))
+                if _valid_company_name(cand):
+                    return cand
+
+        # ---- 3) Table label fallback: look for "公司名稱" label, clean and validate ----
+        label = soup.find(string=re.compile(r"公司名稱"))
+        if label:
+            td = label.find_parent("td")
+            if td and td.find_next_sibling("td"):
+                cand = _clean_company_name(td.find_next_sibling("td").get_text(strip=True))
+                if _valid_company_name(cand):
+                    return cand
+
+    except Exception as e:
+        print(f"AASTOCKS error for {symbol}: {e}")
+    return None
+
+def _get_from_etnet(symbol: str) -> str | None:
+    """
+    Get Traditional Chinese name from ETNet realtime quote.
+    Example: https://www.etnet.com.hk/www/tc/stocks/realtime/quote.php?code=09988
+    """
+    try:
+        code = _pad_hk(symbol)
+        url = f"https://www.etnet.com.hk/www/tc/stocks/realtime/quote.php?code={code}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept-Language": "zh-HK,zh-TW;q=0.9,zh;q=0.8,en-US;q=0.7,en;q=0.6",
+        }
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # 1) Title like "阿里巴巴－Ｗ (09988) 即時報價 - 經濟通"
+        title = soup.find("title")
+        if title:
+            title_text = title.get_text(strip=True)
+            cand = _clean_company_name(title_text, prefer_chinese_segment=True)
+            if _valid_company_name(cand):
+                return cand
+
+        # 2) Try common visible containers
+        for selector in ['h1', 'h2', '.stockname', 'div[class*="StockName"]', 'div[class*="name"]']:
+            for el in soup.select(selector):
+                txt = el.get_text(strip=True)
+                txt = re.sub(r"\([^)]+\)", "", txt)  # remove (09988)
+                txt = txt.replace("即時報價", "").replace("經濟通", "").strip()
+                if _contains_chinese(txt):
+                    return txt
+
+    except Exception as e:
+        print(f"ETNet error for {symbol}: {e}")
+    return None
+
+
+def _get_from_yahoo_hk(symbol: str) -> str | None:
+    """
+    Try Yahoo Finance HK page <title>, which usually contains the Chinese name.
+    Example: https://hk.finance.yahoo.com/quote/9988.HK
+    """
+    try:
+        code = _pad_hk(symbol)
+        code_num = str(int(code)) if code.isdigit() else code  # "09988" -> "9988"
+        url = f"https://hk.finance.yahoo.com/quote/{code_num}.HK"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept-Language": "zh-HK,zh-TW;q=0.9,zh;q=0.8,en-US;q=0.7,en;q=0.6",
+        }
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        title = soup.find("title")
+        if title:
+            name = re.split(r"\s*\(", title.get_text(strip=True), 1)[0]
+            if _contains_chinese(name):
+                return name
+    except Exception as e:
+        print(f"Yahoo HK error for {symbol}: {e}")
+    return None
+
+
+@st.cache_data(ttl=86400)
+def _get_hkex_dual_counter_map() -> dict[str, str]:
+    """
+    Optional official fallback: HKEX Dual-Counter list (contains Chinese short names for dual counters).
+    Cached daily. Not every HK stock is included.
+    Source: https://www.hkex.com.hk/.../Dual_Counter_Security_List.xlsx
+    """
+    try:
+        url = "https://www.hkex.com.hk/-/media/HKEX-Market/Services/Trading/Securities/Securities-Lists/Dual_Counter_Security_List.xlsx"
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        df = pd.read_excel(io.BytesIO(resp.content))
+        # Guess columns (HKEX may change headers slightly)
+        code_col = next(c for c in df.columns if "HKD" in c and "Code" in c)
+        name_col = next(c for c in df.columns if "Chinese" in c and "Name" in c)
+        df["code5"] = (
+            df[code_col].astype(str).str.extract(r"(\d+)").fillna("").astype(str).str.zfill(5)
+        )
+        mapping = dict(zip(df["code5"], df[name_col].fillna("").astype(str)))
+        return mapping
     except Exception:
-        return None
+        return {}
 
-# -----------------------------
+
+def _get_from_hkex_dual(symbol: str) -> str | None:
+    mp = _get_hkex_dual_counter_map()
+    return mp.get(_pad_hk(symbol))
+
+
+def _get_english_name_from_yfinance(symbol: str) -> str:
+    """Fallback to English name from yfinance."""
+    try:
+        ticker = yf.Ticker(f"{symbol}.HK")
+        info = ticker.info
+        name = info.get("longName") or info.get("shortName") or info.get("displayName")
+        return name or f"{symbol}.HK"
+    except Exception:
+        return f"{symbol}.HK"
+
+
+def _get_us_stock_name(symbol: str) -> str:
+    """Get English name for US stocks."""
+    try:
+        ticker = yf.Ticker(symbol)
+        info = ticker.info
+        name = info.get("longName") or info.get("shortName") or info.get("displayName")
+        return name or symbol
+    except Exception:
+        return symbol
+
+
+@st.cache_data(ttl=86400)
+def get_company_name(symbol: str, is_hk_stock: bool = False) -> str:
+    """
+    Returns the company name.
+    For HK stocks, prioritizes Traditional Chinese names via:
+    AASTOCKS → ETNet → Yahoo HK → HKEX dual-counter → yfinance English.
+    """
+    if is_hk_stock:
+        for fn in (_get_from_aastocks, _get_from_etnet, _get_from_yahoo_hk, _get_from_hkex_dual):
+            name = fn(symbol)
+            if name:
+                return name
+        return _get_english_name_from_yfinance(symbol)
+    else:
+        return _get_us_stock_name(symbol)
+
+
+# ================================
 # Indicators
-# -----------------------------
-def calculate_rsi(df, period=14):
-    close_series = df['4. close']
+# ================================
+def calculate_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    close_series = df["4. close"]
     delta = close_series.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -220,8 +473,9 @@ def calculate_rsi(df, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-def calculate_macd(df):
-    close_series = df['4. close']
+
+def calculate_macd(df: pd.DataFrame) -> tuple[pd.Series, pd.Series, pd.Series]:
+    close_series = df["4. close"]
     ema12 = close_series.ewm(span=12, adjust=False).mean()
     ema26 = close_series.ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
@@ -229,13 +483,14 @@ def calculate_macd(df):
     hist = macd - signal
     return macd, signal, hist
 
-def detect_macd_signals(macd, signal):
+
+def detect_macd_signals(macd: pd.Series, signal: pd.Series):
     macd = macd.dropna()
     signal = signal.reindex(macd.index).dropna()
     macd = macd.reindex(signal.index)
     buy_signals, sell_signals = [], []
     for i in range(1, len(macd)):
-        pm, ps = macd.iloc[i-1], signal.iloc[i-1]
+        pm, ps = macd.iloc[i - 1], signal.iloc[i - 1]
         cm, cs = macd.iloc[i], signal.iloc[i]
         if pm < ps and cm > cs:
             buy_signals.append((macd.index[i], cm))
@@ -243,42 +498,45 @@ def detect_macd_signals(macd, signal):
             sell_signals.append((macd.index[i], cm))
     return buy_signals, sell_signals
 
-def sma(series, window):
+
+def sma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window).mean()
 
-def bollinger_bands(close_series, window=20, mult=2.0):
+
+def bollinger_bands(close_series: pd.Series, window: int = 20, mult: float = 2.0):
     mid = close_series.rolling(window).mean()
     std = close_series.rolling(window).std()
     upper = mid + mult * std
     lower = mid - mult * std
     return upper, mid, lower
 
-def stochastic_oscillator(df, k_period=14, d_period=3):
-    high = df['2. high']
-    low = df['3. low']
-    close = df['4. close']
+
+def stochastic_oscillator(df: pd.DataFrame, k_period: int = 14, d_period: int = 3):
+    high = df["2. high"]
+    low = df["3. low"]
+    close = df["4. close"]
     lowest_low = low.rolling(window=k_period).min()
     highest_high = high.rolling(window=k_period).max()
     k = 100 * (close - lowest_low) / (highest_high - lowest_low)
     d = k.rolling(window=d_period).mean()
     return k, d
 
-def atr(df, period=14):
-    high = df['2. high']
-    low = df['3. low']
-    close = df['4. close']
+
+def atr(df: pd.DataFrame, period: int = 14):
+    high = df["2. high"]
+    low = df["3. low"]
+    close = df["4. close"]
     prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
+    tr = pd.concat(
+        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
     return tr.rolling(window=period).mean()
 
-def sentiment_to_emoji(sentiment_score):
-    """Convert sentiment score to an appropriate emoji"""
+
+def sentiment_to_emoji(sentiment_score: float | None) -> str:
+    """Convert sentiment score to an appropriate emoji."""
     if sentiment_score is None:
-        return "❓"  # Unknown sentiment
+        return "❓"  # Unknown
     elif sentiment_score > 0.5:
         return "😊"  # Positive
     elif sentiment_score < 0.3:
@@ -286,8 +544,9 @@ def sentiment_to_emoji(sentiment_score):
     else:
         return "😐"  # Neutral
 
-def sentiment_to_text(sentiment_score):
-    """Convert sentiment score to descriptive text"""
+
+def sentiment_to_text(sentiment_score: float | None) -> str:
+    """Convert sentiment score to descriptive text."""
     if sentiment_score is None:
         return "Unknown sentiment"
     elif sentiment_score > 0.5:
@@ -297,18 +556,17 @@ def sentiment_to_text(sentiment_score):
     else:
         return f"Neutral ({sentiment_score:.2f})"
 
-# -----------------------------
+
+# ================================
 # News & sentiment (cached)
-# -----------------------------
+# ================================
 @st.cache_data(ttl=300)
-def fetch_news_sentiment(symbol, is_hk_stock=False):
+def fetch_news_sentiment(symbol: str, is_hk_stock: bool = False):
     """
     Returns (avg_sentiment: float|None, articles: list[dict])
     Each article: {title, url, source, published_at, sentiment, description}
     """
-    # For HK stocks, we'll try both with and without .HK suffix
     search_symbols = f"{symbol}.HK,{symbol}" if is_hk_stock else symbol
-    
     url = (
         f"https://api.marketaux.com/v1/news/all"
         f"?symbols={search_symbols}&filter_entities=true&language=en&api_token={MARKETAUX_API_KEY}"
@@ -333,40 +591,40 @@ def fetch_news_sentiment(symbol, is_hk_stock=False):
         score = overall if overall is not None else ent_score
         if score is not None:
             sentiments.append(score)
-
         desc = article.get("description") or article.get("snippet") or article.get("summary")
         source_name = (
             (article.get("source") or {}).get("name")
             if isinstance(article.get("source"), dict)
             else article.get("source")
         ) or "Unknown Source"
-
-        articles.append({
-            "title": article.get("title", "No title"),
-            "url": normalize_url(article.get("url")),
-            "source": source_name,
-            "published_at": article.get("published_at"),
-            "sentiment": score,
-            "description": desc
-        })
+        articles.append(
+            {
+                "title": article.get("title", "No title") or "No title",
+                "url": normalize_url(article.get("url")),
+                "source": source_name,
+                "published_at": article.get("published_at"),
+                "sentiment": score,
+                "description": desc,
+            }
+        )
 
     avg_sentiment = (sum(sentiments) / len(sentiments)) if sentiments else None
-
     try:
         articles = sorted(
             articles,
             key=lambda a: pd.to_datetime(a.get("published_at")) if a.get("published_at") else pd.Timestamp.min,
-            reverse=True
+            reverse=True,
         )[:5]
     except Exception:
         articles = articles[:5]
 
     return avg_sentiment, articles
 
-# -----------------------------
+
+# ================================
 # Recommendation logic
-# -----------------------------
-def combined_recommendation(rsi_val, macd_signal, sentiment):
+# ================================
+def combined_recommendation(rsi_val: float, macd_signal: str, sentiment: float | None):
     score = 0
     rsi_text = "Neutral"
     macd_text = "Neutral"
@@ -394,7 +652,6 @@ def combined_recommendation(rsi_val, macd_signal, sentiment):
         sentiment_emoji = sentiment_to_emoji(sentiment)
         sentiment_description = sentiment_to_text(sentiment)
         sentiment_text = f"{sentiment_emoji} {sentiment_description}"
-        
         if sentiment > 0.5:
             score += 1
         elif sentiment < 0.3:
@@ -411,48 +668,91 @@ def combined_recommendation(rsi_val, macd_signal, sentiment):
     else:
         return "⚠️ Sell Recommendation", rsi_text, macd_text, sentiment_text, "error"
 
-# -----------------------------
+
+# ================================
 # UI
-# -----------------------------
+# ================================
 st.title("📊 Stock Analysis Bot")
 
-# Add market selection
+# Market selection
 market_type = st.radio("Select Market:", ("Hong Kong", "US"), horizontal=True)
 
 symbol = st.text_input(
-    "Enter Stock Symbol", 
-    placeholder="e.g., 0001 (HK) or AAPL (US)" if market_type == "Hong Kong" else "e.g., AAPL, MSFT"
+    "Enter Stock Symbol",
+    placeholder="e.g., 0001, 9988" if market_type == "Hong Kong" else "e.g., AAPL, MSFT",
 ).strip().upper()
 
 if symbol:
     is_hk_stock = (market_type == "Hong Kong")
-    df = fetch_stock_data(symbol, is_hk_stock)
-    
-    if df is None or df.empty:
+
+    # Fetch data - now getting both daily and intraday data
+    daily_df, intraday_df = fetch_stock_data(symbol, is_hk_stock)
+    if daily_df is None or daily_df.empty:
         st.error("Failed to fetch stock data. Please check the symbol and try again.")
         st.stop()
 
-    # Window for display (no date selector needed)
+    # Use daily data for charts and indicators
+    df = daily_df
+    
+    # Use intraday data for timestamp if available, otherwise fall back to daily data
+    if intraday_df is not None and not intraday_df.empty:
+        timestamp_df = intraday_df
+    else:
+        timestamp_df = daily_df
+
+    # --- Latest timestamp & delay handling (robust, tz-safe) ---
+
+    def _to_utc_aware(ts) -> pd.Timestamp:
+        """
+        Return a pandas Timestamp that is tz-aware in UTC.
+        - If ts is naive -> localize to UTC
+        - If ts has a timezone -> convert to UTC
+        """
+        ts = pd.to_datetime(ts)
+        # pandas.Timestamp has .tzinfo (Python) and .tz (pandas) attrs
+        if getattr(ts, "tzinfo", None) is None and getattr(ts, "tz", None) is None:
+            return ts.tz_localize("UTC")
+        else:
+            return ts.tz_convert("UTC")
+
+    latest_raw_ts = timestamp_df.index[-1]
+
+    # Make the last data timestamp UTC-aware
+    latest_ts_utc = _to_utc_aware(latest_raw_ts)
+
+    # UTC-aware "now"
+    now_utc = pd.Timestamp.now(tz="UTC")
+
+    # Compute delay in minutes
+    data_delay_min = (now_utc - latest_ts_utc).total_seconds() / 60.0
+    delay_note = "(Delayed)" if data_delay_min > 15 else ""
+
+    # Build display string (you can show in HKT for readability)
+    try:
+        latest_update_str = latest_ts_utc.tz_convert("Asia/Hong_Kong").strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        # Fallback: show UTC
+        latest_update_str = latest_ts_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    # Window for display (last up to 100 points)
     LOOKBACK_DAYS = min(100, len(df))
     idx_plot = df.index[-LOOKBACK_DAYS:]
     df_plot = df.loc[idx_plot]
 
-    # Define series early (prevents NameError)
-    open_series   = df['1. open']
-    high_series   = df['2. high']
-    low_series    = df['3. low']
-    close_series  = df['4. close']
-    volume_series = df['5. volume']
+    # Define series
+    open_series = df["1. open"]
+    high_series = df["2. high"]
+    low_series = df["3. low"]
+    close_series = df["4. close"]
+    volume_series = df["5. volume"]
 
-    latest_update_date = df.index[-1].strftime("%Y-%m-%d")
     display_symbol = f"{symbol}.HK" if is_hk_stock else symbol
 
-    # NEW: fetch display name (HK → Traditional Chinese if possible)
+    # Get company name (HK prioritizes Traditional Chinese)
     company_name = get_company_name(symbol, is_hk_stock) or display_symbol
-    name_part = f"（{company_name}）" if company_name and company_name != display_symbol else ""
 
-    # UPDATED caption: put the name next to the symbol
-    st.caption(f"📅 Latest stock data for {display_symbol}{name_part}: {latest_update_date}")
+    # Caption with precise timestamp and delay status
+    st.caption(f"📅 Latest stock data for {display_symbol} ({company_name}): {latest_update_str} {delay_note}")
 
     # Compute indicators
     rsi = calculate_rsi(df)
@@ -461,7 +761,7 @@ if symbol:
     stoch_k, stoch_d = stochastic_oscillator(df)
     atr14 = atr(df)
 
-    # Precompute overlays on full history, then slice to window
+    # Overlays
     sma20_full = sma(close_series, 20)
     sma50_full = sma(close_series, 50)
     bb_up_series, bb_mid_series, bb_low_series = bollinger_bands(close_series, window=20, mult=2.0)
@@ -472,9 +772,8 @@ if symbol:
     bb_low = bb_low_series.reindex(idx_plot)
 
     # Latest values
-    latest_close = close_series.iloc[-1]
-    company_name = get_company_name(symbol, is_hk_stock) or display_symbol
-    latest_rsi = float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50
+    latest_close = float(close_series.iloc[-1])
+    latest_rsi = float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50.0
     latest_stoch_k = float(stoch_k.iloc[-1]) if not np.isnan(stoch_k.iloc[-1]) else None
     latest_stoch_d = float(stoch_d.iloc[-1]) if not np.isnan(stoch_d.iloc[-1]) else None
     latest_atr = float(atr14.iloc[-1]) if not np.isnan(atr14.iloc[-1]) else None
@@ -487,6 +786,7 @@ if symbol:
         elif macd.iloc[-2] > signal.iloc[-2] and macd.iloc[-1] < signal.iloc[-1]:
             latest_macd_signal = "sell"
 
+    # News & sentiment
     sentiment_score, articles = fetch_news_sentiment(symbol, is_hk_stock)
 
     # Recommendation banner
@@ -498,37 +798,46 @@ if symbol:
     # KPI row
     kpi1, kpi2, kpi3 = st.columns(3)
     with kpi1:
-        st.metric("Last Close", f"${latest_close:,.2f}" if not is_hk_stock else f"HK${latest_close:,.2f}")
+        st.metric("Last Close",
+                  f"${latest_close:,.2f}" if not is_hk_stock else f"HK${latest_close:,.2f}")
     with kpi2:
         st.metric("RSI (14)", f"{latest_rsi:.2f}")
     with kpi3:
         st.metric("Avg Sentiment", f"{sentiment_score:.2f}" if sentiment_score is not None else "N/A")
 
-    # Row: Indicators (left) and News (right)
+    # Two-column layout: Indicators & News
     col_ind, col_news = st.columns([1, 1], gap="large")
 
     with col_ind:
         st.subheader("🎯 Indicators")
-        # Indicators text (includes RSI figure)
+        # Indicators text
         st.markdown(
             f"- {rsi_text} **(RSI: {latest_rsi:.2f})**\n"
             f"- {macd_text}\n"
             f"- {sentiment_text}"
         )
 
-        # Indicator snapshot (compact)
-        sma_bias = (
-            "Bullish (SMA20 > SMA50)" if (sma20_full.iloc[-1] > sma50_full.iloc[-1]) else
-            "Bearish (SMA20 < SMA50)" if (sma20_full.iloc[-1] < sma50_full.iloc[-1]) else
-            "Neutral"
-        )
-        stoch_text = (
-            f"%K: {latest_stoch_k:.1f}, %D: {latest_stoch_d:.1f} — "
-            + ("Overbought (>80)" if (latest_stoch_k is not None and latest_stoch_k > 80) else
-               "Oversold (<20)" if (latest_stoch_k is not None and latest_stoch_k < 20) else
-               "Neutral")
-        ) if (latest_stoch_k is not None and latest_stoch_d is not None) else "N/A"
+        # Snapshot
+        if not pd.isna(sma20_full.iloc[-1]) and not pd.isna(sma50_full.iloc[-1]):
+            if sma20_full.iloc[-1] > sma50_full.iloc[-1]:
+                sma_bias = "Bullish (SMA20 > SMA50)"
+            elif sma20_full.iloc[-1] < sma50_full.iloc[-1]:
+                sma_bias = "Bearish (SMA20 < SMA50)"
+            else:
+                sma_bias = "Neutral"
+        else:
+            sma_bias = "Neutral"
+
+        if latest_stoch_k is not None and latest_stoch_d is not None:
+            stoch_text = (
+                f"%K: {latest_stoch_k:.1f}, %D: {latest_stoch_d:.1f} — "
+                + ("Overbought (>80)" if latest_stoch_k > 80 else "Oversold (<20)" if latest_stoch_k < 20 else "Neutral")
+            )
+        else:
+            stoch_text = "N/A"
+
         atr_text = f"{latest_atr:.2f}" if latest_atr is not None else "N/A"
+
         st.markdown(
             f"- **SMA Bias:** {sma_bias}\n"
             f"- **Stochastic (14,3):** {stoch_text}\n"
@@ -603,23 +912,24 @@ if symbol:
         else:
             st.info("No news articles available at the moment.")
 
+    # ====== Charts ======
     st.subheader("📈 Trends")
 
-    # Price + Volume (top)
+    # Price + Volume (top figure with subplot)
     fig_price = make_subplots(
-        rows=2, cols=1, shared_xaxes=True,
-        vertical_spacing=0.03, row_heights=[0.72, 0.28],
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+        row_heights=[0.72, 0.28],
         specs=[[{"secondary_y": False}], [{"secondary_y": False}]]
     )
 
-    # Candles
+    # Candlesticks
     fig_price.add_trace(
         go.Candlestick(
             x=idx_plot,
-            open=df_plot['1. open'],
-            high=df_plot['2. high'],
-            low=df_plot['3. low'],
-            close=df_plot['4. close'],
+            open=df_plot["1. open"],
+            high=df_plot["2. high"],
+            low=df_plot["3. low"],
+            close=df_plot["4. close"],
             name="Price",
             increasing=dict(line=dict(color="#00B26F")),
             decreasing=dict(line=dict(color="#E45756")),
@@ -628,48 +938,64 @@ if symbol:
     )
 
     # SMA 20/50
-    fig_price.add_trace(go.Scatter(x=idx_plot, y=sma20, mode='lines', name='SMA 20',
-                                   line=dict(color="#1f77b4", width=1.5)), row=1, col=1)
-    fig_price.add_trace(go.Scatter(x=idx_plot, y=sma50, mode='lines', name='SMA 50',
-                                   line=dict(color="#ff7f0e", width=1.5)), row=1, col=1)
+    fig_price.add_trace(
+        go.Scatter(x=idx_plot, y=sma20, mode='lines', name='SMA 20',
+                   line=dict(color="#1f77b4", width=1.5)),
+        row=1, col=1
+    )
+    fig_price.add_trace(
+        go.Scatter(x=idx_plot, y=sma50, mode='lines', name='SMA 50',
+                   line=dict(color="#ff7f0e", width=1.5)),
+        row=1, col=1
+    )
 
-    # Bollinger bands (upper/lower)
-    fig_price.add_trace(go.Scatter(x=idx_plot, y=bb_up, mode='lines', name='BB Upper',
-                                   line=dict(color="rgba(31,119,180,0.4)", width=1)), row=1, col=1)
-    fig_price.add_trace(go.Scatter(x=idx_plot, y=bb_low, mode='lines', name='BB Lower',
-                                   line=dict(color="rgba(31,119,180,0.4)", width=1)), row=1, col=1)
+    # Bollinger bands
+    fig_price.add_trace(
+        go.Scatter(x=idx_plot, y=bb_up, mode='lines', name='BB Upper',
+                   line=dict(color="rgba(31,119,180,0.4)", width=1)),
+        row=1, col=1
+    )
+    fig_price.add_trace(
+        go.Scatter(x=idx_plot, y=bb_low, mode='lines', name='BB Lower',
+                   line=dict(color="rgba(31,119,180,0.4)", width=1)),
+        row=1, col=1
+    )
 
-    # Optional: mark last MACD cross on price
+    # Mark last MACD cross on price
     if buy_signals:
         last_buy = buy_signals[-1][0]
         if last_buy in idx_plot:
-            price_at_buy = df.loc[last_buy, '4. close']
-            fig_price.add_trace(go.Scatter(
-                x=[last_buy], y=[price_at_buy],
-                mode="markers",
-                marker=dict(symbol="triangle-up", color="#00B26F", size=12),
-                name="Buy Xover"
-            ), row=1, col=1)
+            price_at_buy = df.loc[last_buy, "4. close"]
+            fig_price.add_trace(
+                go.Scatter(
+                    x=[last_buy], y=[price_at_buy], mode="markers",
+                    marker=dict(symbol="triangle-up", color="#00B26F", size=12),
+                    name="Buy Xover",
+                ),
+                row=1, col=1
+            )
     if sell_signals:
         last_sell = sell_signals[-1][0]
         if last_sell in idx_plot:
-            price_at_sell = df.loc[last_sell, '4. close']
-            fig_price.add_trace(go.Scatter(
-                x=[last_sell], y=[price_at_sell],
-                mode="markers",
-                marker=dict(symbol="triangle-down", color="#E45756", size=12),
-                name="Sell Xover"
-            ), row=1, col=1)
+            price_at_sell = df.loc[last_sell, "4. close"]
+            fig_price.add_trace(
+                go.Scatter(
+                    x=[last_sell], y=[price_at_sell], mode="markers",
+                    marker=dict(symbol="triangle-down", color="#E45756", size=12),
+                    name="Sell Xover",
+                ),
+                row=1, col=1
+            )
 
-    # Volume colored by up/down (bottom subplot)
-    up_mask = df_plot['4. close'] >= df_plot['1. open']
+    # Volume colored by up/down
+    up_mask = df_plot["4. close"] >= df_plot["1. open"]
     volume_colors = np.where(up_mask, "#C7F2D8", "#F7C9C6")
     fig_price.add_trace(
-        go.Bar(x=idx_plot, y=df_plot['5. volume'], name="Volume", marker_color=volume_colors, opacity=0.8),
+        go.Bar(x=idx_plot, y=df_plot["5. volume"], name="Volume",
+               marker_color=volume_colors, opacity=0.8),
         row=2, col=1
     )
 
-    # Legend below, margin increased to avoid overlap with title
     fig_price.update_layout(
         title=f"{display_symbol} — Price with SMA(20/50) & Bollinger Bands",
         xaxis=dict(showgrid=False),
@@ -678,44 +1004,46 @@ if symbol:
         yaxis2=dict(title="Volume"),
         legend=dict(orientation="h", yanchor="top", y=-0.25, xanchor="left", x=0),
         margin=dict(l=10, r=10, t=60, b=110),
-        height=680
+        height=680,
     )
     st.plotly_chart(fig_price, use_container_width=True)
 
-    # MACD (bottom)
+    # MACD (bottom figure)
     macd_idx = macd.index[-LOOKBACK_DAYS:]
     macd_plot = go.Figure()
-    macd_plot.add_trace(go.Bar(
-        x=macd_idx, y=hist.reindex(macd_idx),
-        name="Histogram", marker_color="#9ecae1"
-    ))
-    macd_plot.add_trace(go.Scatter(
-        x=macd_idx, y=macd.reindex(macd_idx),
-        mode='lines', name='MACD', line=dict(color="#2ca02c", width=1.5)
-    ))
-    macd_plot.add_trace(go.Scatter(
-        x=macd_idx, y=signal.reindex(macd_idx),
-        mode='lines', name='Signal', line=dict(color="#d62728", width=1.5)
-    ))
+    macd_plot.add_trace(
+        go.Bar(x=macd_idx, y=hist.reindex(macd_idx), name="Histogram", marker_color="#9ecae1")
+    )
+    macd_plot.add_trace(
+        go.Scatter(x=macd_idx, y=macd.reindex(macd_idx), mode='lines',
+                   name='MACD', line=dict(color="#2ca02c", width=1.5))
+    )
+    macd_plot.add_trace(
+        go.Scatter(x=macd_idx, y=signal.reindex(macd_idx), mode='lines',
+                   name='Signal', line=dict(color="#d62728", width=1.5))
+    )
+
     # Buy/Sell markers within window
     bxs = [(t, v) for (t, v) in buy_signals if t in macd_idx]
     sxs = [(t, v) for (t, v) in sell_signals if t in macd_idx]
     if bxs:
-        macd_plot.add_trace(go.Scatter(
-            x=[t for (t, v) in bxs], y=[v for (t, v) in bxs],
-            mode='markers', marker=dict(color='green', size=9), name='Buy Xover'
-        ))
+        macd_plot.add_trace(
+            go.Scatter(x=[t for (t, v) in bxs], y=[v for (t, v) in bxs],
+                       mode='markers', marker=dict(color='green', size=9), name='Buy Xover')
+        )
     if sxs:
-        macd_plot.add_trace(go.Scatter(
-            x=[t for (t, v) in sxs], y=[v for (t, v) in sxs],
-            mode='markers', marker=dict(color='red', size=9), name='Sell Xover'
-        ))
+        macd_plot.add_trace(
+            go.Scatter(x=[t for (t, v) in sxs], y=[v for (t, v) in sxs],
+                       mode='markers', marker=dict(color='red', size=9), name='Sell Xover')
+        )
+
     macd_plot.update_layout(
         title="MACD",
-        xaxis_title="Date", yaxis_title="Value",
+        xaxis_title="Date",
+        yaxis_title="Value",
         legend=dict(orientation="h", yanchor="top", y=-0.25, xanchor="left", x=0),
         margin=dict(l=10, r=10, t=50, b=110),
-        height=420
+        height=420,
     )
     st.plotly_chart(macd_plot, use_container_width=True)
 
